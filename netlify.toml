@@ -9,3 +9,8 @@
 
 [build.environment]
   NODE_VERSION = "22"
+
+# Convert Next.js pages and API routes into Netlify deploy artifacts.
+# Enable the runtime explicitly for this existing project migrated from Vite.
+[[plugins]]
+  package = "@netlify/plugin-nextjs"
