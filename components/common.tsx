@@ -1,9 +1,14 @@
 "use client";
-import { useEffect, useRef, type ReactNode } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Heart, X, ArrowUpRight, LoaderCircle } from "lucide-react";
 
 export function Brand({ children }: { children?: ReactNode }) {
-  return <header className="site-header"><a className="brand" href="/" aria-label="默契好友首页"><span className="brand-mark"><Heart size={23} fill="currentColor" /></span><span>默契好友<span className="brand-sub">MOQI CLUB</span></span></a><div className="header-right">{children ?? <><span className="local-badge"><i /> 本地运行</span><a className="text-link" href="/admin">管理后台 <ArrowUpRight size={16}/></a></>}</div></header>;
+  return <header className="site-header"><a className="brand" href="/" aria-label="默契好友首页"><span className="brand-mark"><Heart size={23} fill="currentColor" /></span><span>默契好友<span className="brand-sub">MOQI CLUB</span></span></a><div className="header-right">{children ?? <><span className="local-badge"><i /> <RuntimeText local="本地运行" cloud="云端运行"/></span><a className="text-link" href="/admin">管理后台 <ArrowUpRight size={16}/></a></>}</div></header>;
+}
+export function RuntimeText({ local, cloud }: { local: string; cloud: string }) {
+  const [isLocal, setLocal] = useState<boolean | null>(null);
+  useEffect(() => { setLocal(/^(localhost|127\.0\.0\.1)$/.test(window.location.hostname)); }, []);
+  return <>{isLocal === null ? "专属默契空间" : isLocal ? local : cloud}</>;
 }
 export function Spinner({ label = "正在加载…" }: { label?: string }) { return <div className="loading"><LoaderCircle className="spin" size={24}/><span>{label}</span></div>; }
 export function ErrorBox({ message }: { message: string }) { return message ? <div className="error-box" role="alert">{message}</div> : null; }

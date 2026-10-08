@@ -2,6 +2,10 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { readExecutionProfile } from "./execution-profile.mjs";
 
+// npm's Windows shell can alter a non-ASCII working directory. Resolve the
+// project from this module before the framework reads or cleans build output.
+if (process.platform === "win32") process.chdir(fileURLToPath(new URL("../", import.meta.url)));
+
 const [command, ...args] = process.argv.slice(2);
 if (!["dev", "build"].includes(command)) throw new Error("Expected dev or build.");
 const managedLinux = readExecutionProfile() === "managed-linux";

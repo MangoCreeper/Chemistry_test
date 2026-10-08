@@ -1,5 +1,7 @@
 import { env } from "cloudflare:workers";
 import { AppError, grade, ranked, requireText, usernameOf, validateContent } from "./rules";
+import { hashPassword, verifyPassword } from "./password";
+import { checkOrigin, cookieAttributes } from "./security";
 import type { Quiz, QuizContent, Ranking, Result } from "./types";
 
 type Row = Record<string, string | number | null>;
@@ -20,19 +22,13 @@ async function readBody(request: Request) {
   const decoder = new TextDecoder();
   return chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join("") + decoder.decode();
 }
-function db() { if (!env.DB) throw new Error("本地数据库尚未配置"); return env.DB; }
+function db() { if (!env.DB) throw new Error("数据库尚未配置"); return env.DB; }
 function statement(sql: string, ...args: (string | number | null)[]) { return db().prepare(sql).bind(...args); }
 async function one(sql: string, ...args: (string | number | null)[]) { return statement(sql, ...args).first<Row>(); }
 async function all(sql: string, ...args: (string | number | null)[]) { return (await statement(sql, ...args).all<Row>()).results; }
 const uid = () => crypto.randomUUID().replaceAll("-", "");
 const hex = (array: ArrayBuffer) => Array.from(new Uint8Array(array), (b) => b.toString(16).padStart(2, "0")).join("");
 async function digest(value: string) { return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))); }
-async function passwordHash(password: string, salt = uid()) {
-  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]);
-  const hash = hex(await crypto.subtle.deriveBits({ name: "PBKDF2", salt: new TextEncoder().encode(salt), iterations: 210000, hash: "SHA-256" }, key, 256));
-  return `${salt}:${hash}`;
-}
-function safeEqual(a: string, b: string) { let different = a.length ^ b.length; for (let i = 0; i < a.length; i++) different |= a.charCodeAt(i) ^ (b.charCodeAt(i) || 0); return different === 0; }
 function cookieName(quizId?: string) { return quizId ? `moqi_q_${quizId}` : "moqi_admin"; }
 function cookieValue(request: Request, name: string) { return request.headers.get("cookie")?.split(";").map((c) => c.trim()).find((c) => c.startsWith(`${name}=`))?.slice(name.length + 1); }
 async function session(request: Request, quizId?: string) {
@@ -42,13 +38,13 @@ async function session(request: Request, quizId?: string) {
   if (!s || (quizId ? s.role !== "player" || s.quiz_id !== quizId : s.role !== "admin")) return null;
   return s;
 }
-async function createSession(role: "admin" | "player", quizId?: string, username?: string) {
+async function createSession(request: Request, role: "admin" | "player", quizId?: string, username?: string) {
   const token = uid() + uid(), duration = role === "admin" ? 86400 : 604800;
   await db().batch([
     statement("DELETE FROM sessions WHERE expires_at <= ?", Date.now()),
     statement("INSERT INTO sessions (id,role,quiz_id,username,expires_at) VALUES (?,?,?,?,?)", await digest(token), role, quizId ?? null, username ?? null, Date.now() + duration * 1000),
   ]);
-  return `${cookieName(quizId)}=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=${duration}`;
+  return `${cookieName(quizId)}=${token}; ${cookieAttributes(request, duration)}`;
 }
 function json(value: unknown, status = 200, cookie?: string) {
   const headers = new Headers({ "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" });
@@ -101,25 +97,25 @@ async function adminApi(request: Request, parts: string[]): Promise<Response> {
     if (parts[0] === "setup") {
       if (admin) throw new AppError("管理员已初始化，请直接登录", 409);
       if (password.length < 8) throw new AppError("密码至少需要 8 个字符");
-      const inserted = await statement("INSERT INTO administrators (id,password) VALUES (1,?) ON CONFLICT(id) DO NOTHING", await passwordHash(password)).run();
+      const inserted = await statement("INSERT INTO administrators (id,password) VALUES (1,?) ON CONFLICT(id) DO NOTHING", await hashPassword(password)).run();
       if (!inserted.meta.changes) throw new AppError("管理员已初始化，请直接登录", 409);
     } else {
       const key = "local", failure = loginFailures.get(key);
       if (failure && Date.now() - failure.since < 60000 && failure.count >= 10) throw new AppError("尝试次数较多，请一分钟后重试", 429);
       const stored = String(admin?.password ?? "");
-      if (!admin || !safeEqual(await passwordHash(password, stored.split(":")[0]), stored)) {
+      if (!admin || !await verifyPassword(password, stored)) {
         loginFailures.set(key, { count: failure && Date.now() - failure.since < 60000 ? failure.count + 1 : 1, since: failure && Date.now() - failure.since < 60000 ? failure.since : Date.now() });
         throw new AppError("账号或密码不正确", 401);
       }
       loginFailures.delete(key);
     }
-    return json({ ok: true }, 200, await createSession("admin"));
+    return json({ ok: true }, 200, await createSession(request, "admin"));
   }
   const admin = await session(request);
   if (!admin) throw new AppError("请先登录管理员账号", 401);
   if (parts[0] === "logout" && method === "POST") {
     await statement("DELETE FROM sessions WHERE id=?", String(admin.id)).run();
-    return json({ ok: true }, 200, `${cookieName()}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+    return json({ ok: true }, 200, `${cookieName()}=; ${cookieAttributes(request, 0)}`);
   }
   if (parts[0] !== "quizzes") throw new AppError("接口不存在", 404);
   if (parts.length === 1) {
@@ -193,12 +189,12 @@ async function publicApi(request: Request, parts: string[]): Promise<Response> {
     const body = await input(request), username = usernameOf(body.username);
     if (!await one("SELECT id FROM participants WHERE quiz_id=? AND username=? AND enabled=1", id, username)) throw new AppError("你不在这份试卷的白名单中，请联系出题人", 403);
     if (quiz.status === "closed" && !await one("SELECT id FROM submissions WHERE quiz_id=? AND username=?", id, username)) throw new AppError("这份试卷已关闭答题", 403);
-    return json({ ok: true }, 200, await createSession("player", id, username));
+    return json({ ok: true }, 200, await createSession(request, "player", id, username));
   }
   if (action === "logout" && method === "POST") {
     const s = await session(request, id);
     if (s) await statement("DELETE FROM sessions WHERE id=?", String(s.id)).run();
-    return json({ ok: true }, 200, `${cookieName(id)}=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0`);
+    return json({ ok: true }, 200, `${cookieName(id)}=; ${cookieAttributes(request, 0)}`);
   }
   if (!action && method === "GET") {
     const s = await session(request, id);
@@ -242,8 +238,7 @@ export async function handleApi(request: Request) {
     // leave the local Worker HTTP proxy waiting on its upstream request stream.
     if (!["GET", "HEAD"].includes(request.method)) requestBodies.set(request, await readBody(request));
     const url = new URL(request.url);
-    if (!/^(localhost|127\.0\.0\.1)$/.test(url.hostname)) throw new AppError("本地服务只接受本机访问", 403);
-    if (!["GET", "HEAD"].includes(request.method) && request.headers.get("origin") !== url.origin) throw new AppError("请求来源无效，请从本地网站操作", 403);
+    checkOrigin(request);
     const parts = url.pathname.slice(5).split("/").filter(Boolean).map(decodeURIComponent);
     if (parts[0] === "admin") return await adminApi(request, parts.slice(1));
     if (parts[0] === "quizzes" && /^[a-f0-9]{32}$/.test(parts[1] ?? "")) return await publicApi(request, parts.slice(1));
