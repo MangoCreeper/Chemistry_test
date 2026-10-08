@@ -1,8 +1,9 @@
-import { env } from "cloudflare:workers";
-import { AppError, grade, ranked, requireText, usernameOf, validateContent } from "./rules";
-import { hashPassword, verifyPassword } from "./password";
-import { checkOrigin, cookieAttributes } from "./security";
-import type { Quiz, QuizContent, Ranking, Result } from "./types";
+import { getDb } from "../db/index.ts";
+import { parameterizedQuery } from "../db/query.ts";
+import { AppError, grade, ranked, requireText, usernameOf, validateContent } from "./rules.ts";
+import { hashPassword, verifyPassword } from "./password.ts";
+import { checkOrigin, cookieAttributes } from "./security.ts";
+import type { Quiz, QuizContent, Ranking, Result } from "./types.ts";
 
 type Row = Record<string, string | number | null>;
 const requestBodies = new WeakMap<Request, string>();
@@ -22,10 +23,14 @@ async function readBody(request: Request) {
   const decoder = new TextDecoder();
   return chunks.map((chunk) => decoder.decode(chunk, { stream: true })).join("") + decoder.decode();
 }
-function db() { if (!env.DB) throw new Error("数据库尚未配置"); return env.DB; }
-function statement(sql: string, ...args: (string | number | null)[]) { return db().prepare(sql).bind(...args); }
-async function one(sql: string, ...args: (string | number | null)[]) { return statement(sql, ...args).first<Row>(); }
-async function all(sql: string, ...args: (string | number | null)[]) { return (await statement(sql, ...args).all<Row>()).results; }
+function statement(query: string, ...args: (string | number | null)[]) {
+  return { run: async () => {
+    const result = await getDb().execute(parameterizedQuery(query, args));
+    return { rows: result.rows as Row[], changes: result.rowCount ?? 0 };
+  } };
+}
+async function one(query: string, ...args: (string | number | null)[]) { return (await statement(query, ...args).run()).rows[0] ?? null; }
+async function all(query: string, ...args: (string | number | null)[]) { return (await statement(query, ...args).run()).rows; }
 const uid = () => crypto.randomUUID().replaceAll("-", "");
 const hex = (array: ArrayBuffer) => Array.from(new Uint8Array(array), (b) => b.toString(16).padStart(2, "0")).join("");
 async function digest(value: string) { return hex(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))); }
@@ -40,10 +45,8 @@ async function session(request: Request, quizId?: string) {
 }
 async function createSession(request: Request, role: "admin" | "player", quizId?: string, username?: string) {
   const token = uid() + uid(), duration = role === "admin" ? 86400 : 604800;
-  await db().batch([
-    statement("DELETE FROM sessions WHERE expires_at <= ?", Date.now()),
-    statement("INSERT INTO sessions (id,role,quiz_id,username,expires_at) VALUES (?,?,?,?,?)", await digest(token), role, quizId ?? null, username ?? null, Date.now() + duration * 1000),
-  ]);
+  await statement("DELETE FROM sessions WHERE expires_at <= ?", Date.now()).run();
+  await statement("INSERT INTO sessions (id,role,quiz_id,username,expires_at) VALUES (?,?,?,?,?)", await digest(token), role, quizId ?? null, username ?? null, Date.now() + duration * 1000).run();
   return `${cookieName(quizId)}=${token}; ${cookieAttributes(request, duration)}`;
 }
 function json(value: unknown, status = 200, cookie?: string) {
@@ -85,7 +88,6 @@ async function resultFor(quiz: Quiz, username: string): Promise<Result | null> {
   const rank = (await rankings(quiz.id)).find((s) => s.id === row.id)?.rank ?? 1;
   return { ...rankingRow(row), rank, answers: quiz.content.questions.map((q) => ({ question: q.text, options: q.options, correct: q.correct, selected: answers[q.id], explanation: q.explanation })) };
 }
-const loginFailures = new Map<string, { count: number; since: number }>();
 async function adminApi(request: Request, parts: string[]): Promise<Response> {
   const method = request.method;
   if (parts[0] === "session" && method === "GET") return json({ initialized: !!await one("SELECT id FROM administrators WHERE id=1"), loggedIn: !!await session(request) });
@@ -98,16 +100,16 @@ async function adminApi(request: Request, parts: string[]): Promise<Response> {
       if (admin) throw new AppError("管理员已初始化，请直接登录", 409);
       if (password.length < 8) throw new AppError("密码至少需要 8 个字符");
       const inserted = await statement("INSERT INTO administrators (id,password) VALUES (1,?) ON CONFLICT(id) DO NOTHING", await hashPassword(password)).run();
-      if (!inserted.meta.changes) throw new AppError("管理员已初始化，请直接登录", 409);
+      if (!inserted.changes) throw new AppError("管理员已初始化，请直接登录", 409);
     } else {
-      const key = "local", failure = loginFailures.get(key);
-      if (failure && Date.now() - failure.since < 60000 && failure.count >= 10) throw new AppError("尝试次数较多，请一分钟后重试", 429);
+      const key = "admin", now = Date.now(), failure = await one("SELECT count,since FROM login_attempts WHERE id=?", key);
+      if (failure && now - Number(failure.since) < 60000 && Number(failure.count) >= 10) throw new AppError("尝试次数较多，请一分钟后重试", 429);
       const stored = String(admin?.password ?? "");
       if (!admin || !await verifyPassword(password, stored)) {
-        loginFailures.set(key, { count: failure && Date.now() - failure.since < 60000 ? failure.count + 1 : 1, since: failure && Date.now() - failure.since < 60000 ? failure.since : Date.now() });
+        await statement("INSERT INTO login_attempts (id,count,since) VALUES (?,1,?) ON CONFLICT(id) DO UPDATE SET count=CASE WHEN login_attempts.since>? THEN login_attempts.count+1 ELSE 1 END,since=CASE WHEN login_attempts.since>? THEN login_attempts.since ELSE EXCLUDED.since END", key, now, now - 60000, now - 60000).run();
         throw new AppError("账号或密码不正确", 401);
       }
-      loginFailures.delete(key);
+      await statement("DELETE FROM login_attempts WHERE id=?", key).run();
     }
     return json({ ok: true }, 200, await createSession(request, "admin"));
   }
@@ -128,13 +130,13 @@ async function adminApi(request: Request, parts: string[]): Promise<Response> {
   }
   const id = parts[1], quiz = await quizBy(id);
   if (parts.length === 2) {
-    if (method === "GET") return json({ quiz, participants: await all("SELECT id,username,enabled FROM participants WHERE quiz_id=? ORDER BY username COLLATE BINARY", id), rankings: await rankings(id) });
+    if (method === "GET") return json({ quiz, participants: await all('SELECT id,username,enabled FROM participants WHERE quiz_id=? ORDER BY username COLLATE "C"', id), rankings: await rankings(id) });
     if (method === "PUT") {
       const body = await input(request);
       if (quiz.locked) throw new AppError("已有答题记录，题目和奖励规则已锁定，请复制为新试卷", 409);
       const content = validateContent(body.content, quiz.status !== "draft");
       const updated = await statement("UPDATE quizzes SET title=?,owner=?,description=?,content=?,version=version+1,updated_at=? WHERE id=? AND locked=0 AND version=?", requireText(body.title, "试卷标题", 100), requireText(body.owner, "出题人", 40), typeof body.description === "string" ? body.description.slice(0, 1000) : "", JSON.stringify(content), Date.now(), id, Number(body.version)).run();
-      if (!updated.meta.changes) throw new AppError("试卷已发生变化，请刷新后重试", 409);
+      if (!updated.changes) throw new AppError("试卷已发生变化，请刷新后重试", 409);
       return json({ quiz: await quizBy(id) });
     }
   }
@@ -144,7 +146,7 @@ async function adminApi(request: Request, parts: string[]): Promise<Response> {
     if (body.status === "published") validateContent(quiz.content, true);
     if (body.status === "closed" && quiz.status === "draft") throw new AppError("草稿尚未发布");
     const changed = await statement("UPDATE quizzes SET status=?,version=version+1,updated_at=? WHERE id=? AND version=?", body.status, Date.now(), id, Number(body.version)).run();
-    if (!changed.meta.changes) throw new AppError("试卷已发生变化，请刷新后重试", 409);
+    if (!changed.changes) throw new AppError("试卷已发生变化，请刷新后重试", 409);
     return json({ quiz: await quizBy(id) });
   }
   if (parts[2] === "copy" && method === "POST") {
@@ -158,14 +160,14 @@ async function adminApi(request: Request, parts: string[]): Promise<Response> {
       if (typeof body.names !== "string" || body.names.length > 50000) throw new AppError("请输入用户名，每行一个");
       const names = [...new Set(body.names.split(/\r?\n/).filter((n) => n.trim()).map(usernameOf))];
       if (!names.length || names.length > 500) throw new AppError("每次请添加 1–500 个用户名");
-      const results = await db().batch(names.map((name) => statement("INSERT INTO participants (id,quiz_id,username,enabled) VALUES (?,?,?,1) ON CONFLICT(quiz_id,username) DO UPDATE SET enabled=1", uid(), id, name)));
-      return json({ ok: true, count: results.length });
+      await statement(`INSERT INTO participants (id,quiz_id,username,enabled) VALUES ${names.map(() => "(?,?,?,1)").join(",")} ON CONFLICT(quiz_id,username) DO UPDATE SET enabled=1`, ...names.flatMap((name) => [uid(), id, name])).run();
+      return json({ ok: true, count: names.length });
     }
     if (method === "PATCH" && parts.length === 4) {
       const body = await input(request);
       if (typeof body.enabled !== "boolean") throw new AppError("状态无效");
       const changed = await statement("UPDATE participants SET enabled=? WHERE id=? AND quiz_id=?", body.enabled ? 1 : 0, parts[3], id).run();
-      if (!changed.meta.changes) throw new AppError("用户名不存在", 404);
+      if (!changed.changes) throw new AppError("用户名不存在", 404);
       return json({ ok: true });
     }
   }
@@ -224,10 +226,10 @@ async function publicApi(request: Request, parts: string[]): Promise<Response> {
     const body = await input(request);
     if (body.version !== quiz.version) throw new AppError("试卷内容已更新，请刷新页面重新确认答案", 409);
     const marked = grade(quiz.content, body.answers);
-    const inserted = await statement("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,reward,redeemed_at,submitted_at) SELECT ?,?,?,?,?,?,?,?,NULL,? WHERE EXISTS (SELECT 1 FROM quizzes WHERE id=? AND status='published' AND version=?) AND EXISTS (SELECT 1 FROM participants WHERE quiz_id=? AND username=? AND enabled=1) ON CONFLICT(quiz_id,username) DO NOTHING", uid(), id, username, marked.correct, marked.total, marked.score, JSON.stringify(marked.answers), marked.reward ? JSON.stringify(marked.reward) : null, Date.now(), id, quiz.version, id, username).run();
+    const inserted = await statement("WITH locked_quiz AS (UPDATE quizzes SET locked=1 WHERE id=? AND status='published' AND version=? AND EXISTS (SELECT 1 FROM participants WHERE quiz_id=? AND username=? AND enabled=1) RETURNING id) INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,reward,redeemed_at,submitted_at) SELECT ?,?,?,?,?,?,?,?,NULL,? FROM locked_quiz ON CONFLICT(quiz_id,username) DO NOTHING", id, quiz.version, id, username, uid(), id, username, marked.correct, marked.total, marked.score, JSON.stringify(marked.answers), marked.reward ? JSON.stringify(marked.reward) : null, Date.now()).run();
     const result = await resultFor(await quizBy(id), username);
     if (!result) throw new AppError("试卷状态或白名单已变化，请刷新后重试", 409);
-    return json({ result, alreadySubmitted: !inserted.meta.changes });
+    return json({ result, alreadySubmitted: !inserted.changes });
   }
   throw new AppError("接口不存在", 404);
 }
@@ -245,7 +247,7 @@ export async function handleApi(request: Request) {
     throw new AppError("接口不存在", 404);
   } catch (error) {
     if (error instanceof AppError) return json({ error: error.message }, error.status);
-    console.error("API error", error);
+    console.error("API request failed", error instanceof Error ? error.name : "UnknownError");
     return json({ error: "服务暂时遇到问题，请稍后重试" }, 500);
   }
 }
