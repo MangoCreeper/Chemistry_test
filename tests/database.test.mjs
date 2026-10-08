@@ -1,29 +1,46 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DatabaseSync } from "node:sqlite";
-import { readFileSync, readdirSync } from "node:fs";
-const migration = readdirSync(new URL("../drizzle/", import.meta.url)).find((name) => name.startsWith("0000_") && name.endsWith(".sql"));
-function createDatabase() {
-  const db = new DatabaseSync(":memory:");
-  db.exec(readFileSync(new URL(`../drizzle/${migration}`, import.meta.url), "utf8"));
-  db.prepare("INSERT INTO quizzes (id,title,owner,description,content,created_at,updated_at,status) VALUES ('test','测试','小林','','{}',1,1,'published')").run();
-  return db;
+import { PgDialect } from "drizzle-orm/pg-core";
+import { parameterizedQuery } from "../db/query.ts";
+import { createDatabase } from "./helpers/postgres.mjs";
+
+async function quizDatabase() {
+  const database = await createDatabase();
+  await database.exec("INSERT INTO quizzes (id,title,owner,description,content,created_at,updated_at,status) VALUES ('test','测试','小林','','{}',1791457200000,1791457200000,'published')");
+  return database;
 }
-test("数据库唯一约束阻止重复名字和重复提交", () => {
-  const db = createDatabase();
-  db.prepare("INSERT INTO participants(id,quiz_id,username) VALUES('p','test','阿月')").run();
-  assert.throws(() => db.prepare("INSERT INTO participants(id,quiz_id,username) VALUES('p2','test','阿月')").run());
-  db.prepare("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,reward,submitted_at) VALUES ('s','test','阿月',1,1,100,'{}','奖券',1)").run();
-  assert.throws(() => db.prepare("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,submitted_at) VALUES ('s2','test','阿月',0,1,0,'{}',2)").run());
-  assert.equal(db.prepare("SELECT count(*) AS n FROM submissions").get().n, 1); db.close();
+
+test("Postgres 唯一约束阻止重复名字和重复提交，时间戳支持毫秒", async () => {
+  const database = await quizDatabase();
+  try {
+    await database.exec("INSERT INTO participants(id,quiz_id,username) VALUES('p','test','阿月')");
+    await assert.rejects(database.exec("INSERT INTO participants(id,quiz_id,username) VALUES('p2','test','阿月')"));
+    await database.exec("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,submitted_at) VALUES ('s','test','阿月',1,1,100,'{}',1791457200000)");
+    await assert.rejects(database.exec("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,submitted_at) VALUES ('s2','test','阿月',0,1,0,'{}',1791457200001)"));
+    assert.equal((await database.query("SELECT count(*) AS count FROM submissions")).rows[0].count, 1);
+    assert.equal(Number((await database.query("SELECT created_at FROM quizzes")).rows[0].created_at), 1791457200000);
+  } finally { await database.close(); }
 });
-test("首次提交原子锁定规则，重置不会解除锁定", () => {
-  const db = createDatabase(); assert.equal(db.prepare("SELECT locked FROM quizzes").get().locked, 0);
-  db.prepare("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,submitted_at) VALUES ('s','test','阿月',1,1,100,'{}',1)").run();
-  assert.equal(db.prepare("SELECT locked FROM quizzes").get().locked, 1);
-  assert.throws(() => db.prepare("UPDATE quizzes SET content='changed' WHERE id='test'").run());
-  db.prepare("DELETE FROM submissions WHERE id='s'").run();
-  assert.equal(db.prepare("SELECT locked FROM quizzes").get().locked, 1);
-  db.prepare("UPDATE quizzes SET status='closed' WHERE id='test'").run();
-  assert.equal(db.prepare("SELECT status FROM quizzes").get().status, "closed"); db.close();
+
+test("Postgres 首次提交原子锁定规则，重置不能解除锁定", async () => {
+  const database = await quizDatabase();
+  try {
+    assert.equal((await database.query("SELECT locked FROM quizzes")).rows[0].locked, 0);
+    await database.exec("INSERT INTO submissions (id,quiz_id,username,correct,total,score,answers,submitted_at) VALUES ('s','test','阿月',1,1,100,'{}',1)");
+    assert.equal((await database.query("SELECT locked FROM quizzes")).rows[0].locked, 1);
+    await assert.rejects(database.exec("UPDATE quizzes SET content='changed' WHERE id='test'"));
+    await assert.rejects(database.exec("UPDATE quizzes SET locked=0 WHERE id='test'"));
+    await database.exec("DELETE FROM submissions WHERE id='s'");
+    assert.equal((await database.query("SELECT locked FROM quizzes")).rows[0].locked, 1);
+    await database.exec("UPDATE quizzes SET status='closed' WHERE id='test'");
+    assert.equal((await database.query("SELECT status FROM quizzes")).rows[0].status, "closed");
+  } finally { await database.close(); }
+});
+
+test("SQL 参数保留引号和问号，不拼接用户输入", () => {
+  const value = "O'Brien?'; DROP TABLE quizzes; --";
+  const query = new PgDialect().sqlToQuery(parameterizedQuery("SELECT * FROM quizzes WHERE title=? AND locked=?", [value, 0]));
+  assert.equal(query.sql, "SELECT * FROM quizzes WHERE title=$1 AND locked=$2");
+  assert.deepEqual(query.params, [value, 0]);
+  assert.throws(() => parameterizedQuery("SELECT ?", []));
 });
